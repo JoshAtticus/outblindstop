@@ -1,0 +1,16 @@
+# Firmware dumps, NEVER commit (IMEI, SIM/efs2 data, carrier config, certs)
+backup/
+extracted/
+
+# Rendered animation frames
+tools/frames/
+*.mp4
+*.tar
+
+# Personal configs with real certs/keys and your home IP. The shareable base
+# profile lives in ovpn/
+local/
+
+# Python
+__pycache__/
+*.pyc

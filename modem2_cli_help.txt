@@ -1,0 +1,297 @@
+---------------------------------------------------------------------------
+ ----------------          - Below list is miscellaneous simulated events
+ update_band_conflict      - Private API: simulate a rf band conflict event from modem
+ update_cat_browser        - Private API: simulate a cat launch browser event from modem
+ update_cat_text           - Private API: simulate a cat display text event from modem
+ update_conn_state         - Private API: to generate connection state events
+ update_ddtm               - Private API: simulate a ddtm status event from modem
+ update_e911               - Private API: simulate a emergency mode event from modem
+ update_lifetime_cnt       - Private API: simulate a lifetime counter event from modem
+ update_network_bars       - Private API: simulate a signal bars event from modem
+ update_network_cellid     - Private API: simulate a cell id event from modem
+ update_network_dbm        - Private API: simulate a network dbm event from modem
+ update_network_ecio       - Private API: simulate a ecio event from modem
+ update_network_extender   - Private API: simulate a network extender(femto) event from modem
+ update_network_lac        - Private API: simulate a lac event from modem
+ update_network_operator   - Private API: simulate a network operator event from modem
+ update_network_reg        - Private API: simulate a network registration event from modem
+ update_network_rsrp       - Private API: simulate a rsrp event from modem
+ update_network_rsrq       - Private API: simulate a rsrq event from modem
+ update_network_rssi       - Private API: simulate a rssi event from modem
+ update_network_service    - Private API: simulate a service event from modem
+ update_network_sidnid     - Private API: simulate a sid/nid event from modem
+ update_network_sinr       - Private API: simulate a sinr event from modem
+ update_network_snr        - Private API: simulate a snr event from modem
+ update_network_time       - Private API: simulate a network time event from modem
+ update_pip_tone           - Private API: simulate a voice pip tone event from modem
+ update_signal_cdma        - Private API: simulate a cdma signal event from modem
+ update_signal_gsm         - Private API: simulate a gsm signal event from modem
+ update_signal_hdr         - Private API: simulate a hdr signal event from modem
+ update_signal_lte         - Private API: simulate a lte signal event from modem
+ update_signal_wcdma       - Private API: simulate a wcdma signal event from modem
+ update_signal_5g          - Private API: simulate a 5g network signal event
+ update_sim_act            - Private API: simulate a sim activation event from modem
+ update_uati               - Private API: simulate a uati event from modem
+ update_voice_cellid       - Private API: simulate a voice cell id event from modem
+ update_voice_lac          - Private API: simulate a voice lac event from modem
+ update_voice_mccmnc       - Private API: simulate a voice mcc/mnc event from modem
+ update_voice_plmn_name    - Private API: simulate a voice operaor name(plmn) event from modem
+ update_voice_reg          - Private API: simulate a voice registration event from modem
+ update_voice_roam         - Private API: simulate a voice roam state event from modem
+ update_voice_svc          - Private API: simulate a voice service event from modem
+ update_wap_push           - Private API: simulate a wap push event from modem
+ update_reject_code        - Private API: simulate a network reject code
+ update_pco_event          - Private API: simulate a network pco event
+ update_nr5g_icon          - Private API: simulate a nr5g icon event
+ ----------------          - Below list is miscellaneous commands.
+ get_call_throttle_status  - Determine whether calls should be throttled
+ set_call_throttle_enabled - Enables or disables call throttling
+ get_reject_cause_code     - Get the last known network reject code
+ 1xrtt_get_ext_timer       - get 1xrtt ext timer
+ 1xrtt_set_ext_timer       - set 1xrtt ext timer
+ active_band_get           - get the active bands
+ active_channel_get        - get the active channel
+ band_class_get_enabled    - get the band class enabled
+ band_class_set_enabled    - set the band class enabled
+ bsr_get_timers            - Gets the bsr timers
+ bsr_set_timers            - Sets the bsr timers
+ set_lte_tm9               - Sets the tm9 options
+ set_lte_band_option       - Sets the lte band options
+ set_sim_lock              - Sets the sim lock status
+ get_sim_lock              - Get the sim lock status
+ set_ims_enable            - Sets the ims enabled state
+ set_lte_qam_status        - Sets the lte qam status
+ cai_get                   - Gets the cai rev
+ cai_set                   - Sets the cai rev
+ ca_get_enabled            - get the carrier agreate enabled status
+ ca_set_enabled            - set the carrier agreate enabled status
+ ca_bands_get_enabled      - get the carrier agreate bands enabled
+ ca_bands_set_enabled      - set the carrier agreate bands enabled
+ ca_tri_bands_set_enabled  - set the carrier agreate tri bands enabled
+ ca_tri_bands_get_enabled  - get the carrier agreate tri bands enabled
+ get_autonomous_gap_enabled - get the autonomous gap enabled status
+ set_autonomous_gap_enabled - set the autonomous gap enabled status
+ check_lte_ca_status       - check the lte carrier agregate status
+ ddtm_get                  - Gets the ddtm state
+ ddtm_set                  - Sets the ddtm state
+ efs_read                  - Reads an efs file
+ efs_write                 - Writes an efs file
+ efs_read_large            - Reads an efs file using a shared memory buffer
+ efs_write_large           - Writes an efs file using a shared memory buffer
+ efs_delete                - Deletes an efs file
+ ehrpd_get_enabled         - ehrpd get enabled status
+ ehrpd_set_enabled         - ehrpd set enabled status
+ ehrpd_get_state           - ehrpd get enabled state
+ ehrpd_set_state           - ehrpd set enabled state
+ emergency_get_mode        - get emergency mode
+ factory_reset             - Initiates a modem backup, factory reset and restore
+ get_diag_info             - Gets the diagnostic info
+ get_refurb_info           - Gets the refurbish details
+ get_act_date              - Gets the activation date
+ get_sup_tech              - Gets the tech modes supported by the modem
+ ims_reg_set_delay         - ims registration set delay
+ ims_pres_get_config       - get Ims presence config
+ ims_pres_set_config       - set Ims presence config
+ ims_lvc_get_enabled       - get ims lvc enabled
+ ims_lvc_set_enabled       - set ims lvc enabled
+ ims_set_sip_timer         - set ims sip timer
+ ims_get_sip_data          - get ims sip data
+ ims_set_sip_data          - set ims sip data
+ ims_get_sms_data          - get ims sms data
+ unlock_carrier            - Unlocks the carrier lock
+ lbs_get                   - Gets lbs idle mode query enabled
+ lbs_set                   - Sets lbs idle mode query enabled
+ lifetime_counters_get     - get lifetime counters
+ lifetime_counters_update  - set lifetime counters
+ lte_band_get_enabled      - get lte bands enabled
+ lte_band_set_enabled      - set lte bands enabled
+ lte_band_get_prior        - get lte bands priority list
+ lte_band_set_prior        - set lte bands priority list
+ pdn_get_override_param    - get pdn override parameter
+ pdn_set_override_param    - set pdn override parameter
+ pdn_get_ext_params        - get pdn extra context parameters
+ pdn_set_ext_params        - set pdn extra context parameters
+ powersave                 - Enables or disables powersave mode
+ prof_get_tech             - Gets the modem technology profile for the given type and index
+ prof_get_pri_tech         - Gets the modem technology profile of the PRIed indexs
+ prof_get_cust_tech        - Gets the modem technology profile of the Custom indexs
+ prof_set_tech             - Sets the modem technology profile for the given type and index
+ prof_set_pri_tech         - Sets the modem technology profile for the PRIed indexs
+ prof_set_cust_tech        - Sets the modem technology profile for the Custom indexs
+ prof_get_act_tech         - Gets the active modem technology profile for the given index
+ prof_set_act_tech         - Sets the active modem technology profile for the given index
+ roam_get_enabled          - Gets the enabled status of roaming
+ roam_set_enabled          - Sets the enabled status of roaming
+ get_roam_guard_settings   - Gets the roam_guard_Settings
+ set_roam_guard_settings   - Sets the roam_guard_Settings
+ roam_get_intl_enabled     - Gets the enabled status of international roaming
+ roam_set_intl_enabled     - Sets the enabled status of international roaming
+ roam_get_eri              - Gets the device ERI from the modem
+ mdn_min_set               - set the mdn and min strings
+ mip_get_settings          - gets the mip setting
+ mip_set_settings          - sets the mip setting
+ mip_get_profile           - gets the mip profile
+ mip_set_profile           - sets the mip profile
+ mns_get_info              - Gets mns information
+ mns_start_scan            - Starts the mns scan thread
+ mns_get_list              - Gets the mns list from a previous scan
+ mns_clear_list            - Clears the mns list from a previous scan
+ mns_set_oper              - Sets the manually selected network and attempts to attach to it
+ mns_validate              - Returns whether the current manual network selections is valid.
+ network_attach            - set network attach status
+ radio_is_enabled          - is the radio enabled
+ radio_set_enabled         - set the radio enabled
+ 5g_radio_is_enabled       - is the 5G radio enabled
+ 5g_radio_set_enabled      - set the 5G radio enabled
+ sd_config_get_setting     - get sd_config ext setting
+ sd_config_set_setting     - set sd_config ext setting
+ sim_enable_pin            - Sets the sim pin lock
+ sim_unlock_pin            - Unlocks the sim pin lock
+ sim_unlock_puk            - Unlocks the sim puk lock
+ sim_change_pin            - Set a new pin
+ sim_pin_get_status        - Gets the sim pin status
+ sim_get_carrier           - Gets the carrier based on the sim
+ sim_get_gid1              - Gets the sim GID1
+ sim_get_gid2              - Gets the sim GID2
+ sim_get_iccid             - Gets the sim iccd
+ get_imsi                  - Gets IMSI
+ sim_get_mnc_length        - Gets the length of MNC
+ validate_spc              - Enable the SPC code
+ volte_get_amr_mode        - get volte amr mode
+ volte_set_amr_mode        - set volte amr mode
+ volte_get_amr_wb_mode     - get volte amr wideBand mode
+ volte_set_amr_wb_mode     - set volte amr wideBand mode
+ volte_get_dcmo_timer      - get volte dcmo timer
+ volte_set_dcmo_timer      - set volte dcmo timer
+ volte_get_dcmo_tdelay     - get volte dcmo timer delay
+ volte_set_dcmo_tdelay     - set volte dcmo timer delay
+ volte_get_enabled         - get the volte enabled status
+ volte_set_enabled         - set the volte enabled status
+ volte_get_hd_voice_enab   - get volte HD voice enabled
+ volte_set_hd_voice_enab   - set volte HD voice enabled
+ volte_get_hys             - get volte hys
+ volte_set_hys             - set volte hys
+ volte_get_rcl_max_entries - get volte rcl max entries
+ volte_set_rcl_max_entries - set volte rcl max entries
+ volte_get_sess_config     - volte get session config
+ volte_set_sess_config     - volte set session config
+ volte_get_silent_redial   - get volte silent redial
+ volte_set_silent_redial   - set volte silent redial
+ volte_get_src_thttle      - get volte source throttle publish
+ volte_set_src_thttle      - set volte source throttle publish
+ volte_get_tlte_911fail    - get volte tlte 911fail
+ volte_set_tlte_911fail    - set volte tlte 911fail
+ enable_data_call          - Enables or disables data calls at the modemd level
+ get_world_mode_enabled    - Returns whether the modem is in world mode or not
+ get_pco_event             - Returns latest pco event details
+ get_apn_from_database     - Returns the profile details for the given sim
+ get_custom_apn_from_database - Returns the profile details for the given imsi
+ set_custom_apn_to_database - Writes the profile details for the given imsi
+ get_custom_apn_from_db_using_imsi - Returns the profile details for the given imsi
+ set_custom_apn_to_db_using_imsi - Writes the profile details for the given imsi
+ get_custom_apn_from_db_using_iccid - Returns the profile details for the given imsi
+ set_custom_apn_to_db_using_iccid - Writes the profile details for the given imsi
+ validate_apn              - Determines whether the apn has been used successfully or not
+ run_raw_command           - Runs a raw command using the modem port
+ set_lte_wifi_coex         - Enables or disables LTE-U to allow coexistence with WiFi 5GHZ
+ get_modem_id              - Returns the modem identification retrieved from usb driver
+ set_5g_tuwb               - Sets the 5g delay timer on loss of 5G service
+ get_5g_tuwb               - Gets the 5g delay timer on loss of 5G service
+ get_bytes_counters        - Gets the bytes counters for the current call
+ get_5g_icon_mode          - Gets the 5g icon mode (A,B,C or D)
+ set_5g_icon_mode          - Sets the 5g icon mode (A,B,C or D)
+ get_ecgi                  - Gets the ecgi
+ get_ext_ant_enabled       - Gets the smart switch ext antenna setting
+ set_ext_ant_enabled       - Sets the smart switch ext antenna setting
+ get_enabled_lte_bands     - Gets enabled bands
+ set_enabled_lte_bands     - Sets enabled bands
+ get_enabled_nr5g_nsa_bands - Gets enabled bands
+ set_enabled_nr5g_nsa_bands - Sets enabled bands
+ get_enabled_nr5g_sa_bands - Gets enabled bands
+ set_enabled_nr5g_sa_bands - Sets enabled bands
+ get_fcc_id                - Gets the fcc id from NV item 60111
+ get_eirp                  - Gets the eirp from the first element of NV item 6853
+ get_nr5g_disable_mode     - Gets the NR5G SA/NSA disable mode
+ set_nr5g_disable_mode     - Sets the NR5G SA/NSA disable mode
+ get_dss                   - Gets the dss
+ ----------------          - Below list is common events.
+ update_sim_status         - Private API: simulate a sim status event from modem
+ update_wwan_state         - Private API: simulate a wan state event from modem
+ update_roam_state         - Private API: simulate a roam state event from modem
+ update_roam_ctrl          - Private API: simulate a roam ctrl event from modem
+ update_oprt_mode          - Private API: simulate a operating mode(radio on/off) event from modem
+ update_mns                - Private API: simulate a manual network selection info event from modem
+ update_plmn_mode          - Private API: simulate a plmn mode event from modem
+ update_plmn_name          - Private API: simulate a operator name(plmn name) event from modem
+ update_oper_name          - Private API: simulate a operator name event from modem
+ ----------------          - Below list is popular commands.
+ help                      - Prints out usage and command listing.
+ rc_to_str                 - converts the modem2 error code to a string.
+ is_running                - Tells if the associated process is running.
+ call_get_status           - gets the call status of the specified v4/v4 and APN
+ call_start                - Starts an ipv4 or ipv6 data call to the specified APN
+ call_stop                 - Stops an ipv4 or ipv6 data call to the specified APN
+ active_tech_get           - Gets the tech modes currently being used by the modem
+ enabled_tech_get          - Gets the curently enabled tech modes
+ enabled_tech_set          - Sets the curently enabled tech modes
+ get_oper_info             - Gets network operator information
+ get_network_time          - Gets the current time and timezone info from the network
+ get_cached_time           - Gets the cached network time (from the last network time update)
+ get_carrier_unlock        - Gets the carrier unlock status
+ get_info                  - Gets modem information
+ get_state                 - Gets current modem state
+ get_signal                - Gets current modem data signal stats
+ get_voice_signal          - Gets current modem voice signal stats
+ get_5g_status             - Gets current 5g modem data status
+ get_service_info          - Gets the current service type and roaming indication
+ sim_get_status            - Gets the sim status
+ validate_home             - Determines whether we are in the home network or not
+ modem_init                - Initialize the modem based on the modem manufacturer
+ get_5g_band_pci           - Gets 5G active band and PCI
+ get_serving_cell_id       - Gets Serving Cell ID
+ get_earfcn                - Gets earfcn
+ get_neighbor_list         - Gets Neighbor List
+ get_bandwidth             - Gets Bandwidth
+ get_arfcn_list            - Gets arfcn list
+ get_ca_band_list          - Gets ca band list
+ get_lte_embms_info        - Gets lte embms info
+ get_tx_rx_info            - Gets tx rx info
+ get_rach_fail             - Gets lte rach failures since bootup
+ get_test_sim_status       - gets whether test sim or not
+ ----------------          - Below List is location survey commands
+ loc_survey_get_status     - Gets location survey status
+ loc_survey_get_result     - Gets location survey Result
+ loc_survey_get_fr         - location survey Get FR
+ loc_survey_location_selected - location survey location selected
+ loc_survey_stop           - location survey stop
+ loc_survey_is_installed   - location survey is installed already or not
+ loc_survey_get_rsrp       - location survey get rsrp
+ loc_survey_course_start   - location survey Course Algorithm Start
+ loc_survey_course_stop    - location survey Course Algorithm Stop
+ loc_survey_complete       - location survey Algorithm Completed
+ loc_survey_test_stubs     - location survey Test with Stub Data
+ ----------------          - End of location survey commands
+ get_aggregated_bandwidth  - Gets aggregated Bandwidth
+ get_supported_band_list   - Gets supported bands
+ get_packet_statistics     - Gets packet statistics
+ sim_mgr_get_num_sims      - Num of Sims present
+ sim_mgr_switch_slot       - Switching of Sim Slot
+ sim_mgr_get_info          - Dual-Sim get  info
+ sim_mgr_get_slot_info     - Dual-Sim get slot info
+ sim_mgr_get_active_slot   - Dual-Sim get acitve slot 
+ sim_mgr_get_active_imsi   - Dual-Sim get acitve imsi 
+ sim_mgr_set_active_imsi   - Dual-Sim set acitve imsi 
+ sim_mgr_get_imsi_priority - Dual-Sim GET IMSI Priority 
+ sim_mgr_set_imsi_priority - Dual-Sim SET IMSI Priority 
+ sim_mgr_get_imsi_simConfig_db - Dual-Sim GET IMSI Based SimConfig from DB 
+ uim_get_physical_slot_status - Dual-Sim get physical slots status
+ sim_mgr_sim_switch_status - Dual-Sim get sim switch status
+ ----------------          - 
+ get_multi_apn_list        - Get the profile list
+ set_multi_apn_list        - Set the profile list
+ multi_apn_add_profile     - Add a new the profile to the list
+ multi_apn_update_profile  - Update an existing profile
+ multi_apn_delete_profile  - Delete an existing profile
+ multi_apn_restore_default_profile - Restore a default profile
+ multi_apn_get_default_profile - Read a default profile
+  ---------------------------------------------------------------------------
