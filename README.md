@@ -1,7 +1,7 @@
 # outblindstop
 <img width="1019" height="276" alt="outblindstop" src="https://github.com/user-attachments/assets/9ac8bac9-df7c-4c01-878b-50562143f6ca" />
 
-Root access & tweaks for inseego M2xx and M3xx devices.
+Root access & tweaks for inseego M2xxx and M3xxx devices.
 
 Tested on an M3200 (Telstra, SDX65). Other M2xxx / M3xxx devices should work but are untested.
 
