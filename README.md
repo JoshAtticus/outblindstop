@@ -4,7 +4,7 @@ Root access & tweaks for inseego M2xx and M3xx devices.
 
 Tested on an M3200 (Telstra, SDX65). Other M2xxx / M3xxx devices should work but are untested.
 
-Use this on your own device. Carrier locks, warranty and radio regulations still apply, and IMEI changes may be illegal where you live.
+Use this on your own device. This does not remove SIM lock if your device has it, and IMEI changes may be illegal where you live.
 
 ## Quick start
 1. Connect to the hotspot's WiFi
