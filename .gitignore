@@ -1,6 +1,7 @@
 # Firmware dumps, NEVER commit (IMEI, SIM/efs2 data, carrier config, certs)
 backup/
 extracted/
+pulled/
 
 # Rendered animation frames
 tools/frames/

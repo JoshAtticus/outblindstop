@@ -16,12 +16,15 @@ import hashlib
 import http.server
 import os
 import re
+import shlex
 import socket
 import subprocess
 import sys
+import tarfile
+import tempfile
 import threading
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import paramiko
 import requests
@@ -113,8 +116,11 @@ def read_key():
 
 
 def menu(title, options, info_lines=()):
-    """Draws an arrow-key menu, returns the chosen index. Ctrl+C = cancel (-1)."""
+    """Draws an arrow-key menu, returns the chosen index. Ctrl+C = cancel (-1).
+    Long lists are windowed to the terminal height so nothing scrolls off the
+    top; hidden entries are marked with '... N more' indicator lines."""
     sel = 0
+    start = 0
     while True:
         clear()
         banner()
@@ -122,11 +128,27 @@ def menu(title, options, info_lines=()):
         for line in info_lines:
             print(f"  {line}")
         print()
-        for i, opt in enumerate(options):
+        try:
+            rows = os.get_terminal_size().lines
+        except OSError:
+            rows = 30
+        # fixed overhead: banner(8) + title(2) + blank(2) + indicators(2)
+        # + footer(2) + slack(2), so the list always fits on one screen
+        visible = max(4, rows - len(info_lines) - 18)
+        if sel < start:
+            start = sel
+        elif sel >= start + visible:
+            start = sel - visible + 1
+        end = start + visible
+        if start > 0:
+            print(f"  {DIM}... {start} more above{RESET}")
+        for i in range(start, min(end, len(options))):
             if i == sel:
-                print(f"  {CYAN}{BOLD} > {opt}{RESET}")
+                print(f"  {CYAN}{BOLD} > {options[i]}{RESET}")
             else:
-                print(f"    {DIM}{opt}{RESET}")
+                print(f"    {DIM}{options[i]}{RESET}")
+        if end < len(options):
+            print(f"  {DIM}... {len(options) - end} more below{RESET}")
         print(f"\n  {DIM}[arrows] move   [enter] select   [ctrl+c] back{RESET}")
         key = read_key()
         if key == "ctrlc":
@@ -190,6 +212,33 @@ def ssh_exec(cli, cmd, timeout=30):
     return rc, out, stderr.read().decode(errors="replace").strip()
 
 
+def ssh_ensure(cli):
+    """Return a live ssh client, reconnecting if the device dropped us.
+    Dropbear restarts right after rooting and kills idle sessions, so a
+    client that was fine a moment ago can be dead by the time the user
+    answers a menu. Re-check instead of crashing on a stale socket."""
+    try:
+        cli.exec_command("true", timeout=5)[1].read()
+        return cli
+    except Exception:
+        try:
+            cli.close()
+        except Exception:
+            pass
+        last = None
+        for _ in range(5):
+            try:
+                cli = ssh_connect()
+                cli.exec_command("true", timeout=5)[1].read()
+                ok("reconnected over ssh")
+                return cli
+            except Exception as e:
+                last = e
+                time.sleep(2)
+        fail(f"could not reconnect over ssh: {last}")
+        return None
+
+
 def push_bytes(cli, path, data):
     """Write bytes to a device path via exec channel (dropbear has no sftp)."""
     chan = cli.get_transport().open_session()
@@ -197,6 +246,238 @@ def push_bytes(cli, path, data):
     chan.sendall(data)
     chan.shutdown_write()
     return chan.recv_exit_status()
+
+
+# ---------------------------------------------------------- file transfers --
+
+def pull_from_device(cli, remote_path, out_dir="pulled"):
+    """Pull any file or folder off the device as a streamed tar and unpack it.
+    tar czf - runs on the device so /tmp never has to hold the archive."""
+    remote_path = remote_path.strip()
+    expected = remote_path.strip("/")
+    name = expected.replace("/", "_") or "root"
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tarball = out_dir / f"{name}.tar.gz"
+
+    show_device_screen(cli, "operation-inprogress")
+    print(f"  {CYAN}streaming {remote_path} -> {tarball}{RESET}")
+    _, stdout, _ = cli.exec_command(f"tar czf - {shlex.quote(remote_path)}")
+    with open(tarball, "wb") as f:
+        while True:
+            chunk = stdout.read(1 << 16)
+            if not chunk:
+                break
+            f.write(chunk)
+    rc = stdout.channel.recv_exit_status()
+    if rc != 0 or tarball.stat().st_size == 0:
+        fail(f"tar failed on device (exit {rc}) - does the path exist?")
+        return None
+
+    dest = out_dir / name
+    skipped = 0
+
+    def _pull_filter(member, path):
+        # device trees are full of absolute symlinks (/sdcard -> /mnt/sdcard)
+        # and dev nodes that the stock data filter aborts on. none of that
+        # matters for a pull-to-PC copy, so skip those members instead.
+        nonlocal skipped
+        if member.issym() or member.islnk() or member.ischr() \
+                or member.isblk() or member.isfifo():
+            skipped += 1
+            return None
+        return tarfile.data_filter(member, path)
+
+    with tarfile.open(tarball, "r:gz") as tf:
+        members = tf.getmembers()
+        for m in members:
+            if not (m.name == expected or m.name.startswith(expected + "/")):
+                fail(f"unexpected path in tar, refusing to extract: {m.name}")
+                return None
+        try:
+            tf.extractall(dest, filter=_pull_filter)
+        except TypeError:
+            # paths already validated above, so the pre-3.12 call is safe
+            tf.extractall(dest)
+
+    files = [m for m in members if m.isfile()]
+    ok(f"pulled {len(files)} files -> {dest}"
+       + (f" ({skipped} symlinks/dev nodes skipped)" if skipped else ""))
+    for m in sorted(files, key=lambda m: m.name):
+        print(f"    {m.name}  ({m.size} B)")
+    show_device_screen(cli, "operation-done")
+    return dest
+
+
+def push_to_device(cli, local_path, remote_path, make_exec=False):
+    """Push a local file or folder tree to the device. The tar is built on the
+    PC (Windows tarfile has no gzip streaming) and piped straight into
+    'tar xzf -' on the device. Arcname is derived from the remote path so the
+    file lands exactly where you asked."""
+    local = Path(local_path)
+    remote_path = remote_path.rstrip("/")
+    base = str(Path(remote_path).parent)
+    arcname = Path(remote_path).name if local.is_file() else (
+        Path(remote_path).name or local.name)
+
+    show_device_screen(cli, "operation-inprogress")
+    cmd = f"mkdir -p {shlex.quote(base)} && tar xzf - -C {shlex.quote(base)}"
+    with tempfile.TemporaryDirectory() as tmp:
+        tarball = Path(tmp) / "push.tar.gz"
+        with tarfile.open(tarball, "w:gz") as tf:
+            tf.add(local, arcname=arcname)
+            want = sum(1 for m in tf.getmembers() if m.isfile())
+        chan = cli.get_transport().open_session()
+        chan.exec_command(cmd)
+        with open(tarball, "rb") as f:
+            while True:
+                chunk = f.read(1 << 16)
+                if not chunk:
+                    break
+                chan.sendall(chunk)
+        chan.shutdown_write()
+        rc = chan.recv_exit_status()
+    if rc != 0:
+        fail(f"push failed on device (exit {rc})")
+        return False
+
+    # verify what actually landed, trust nothing
+    if local.is_file():
+        _, out, _ = ssh_exec(cli, f"md5sum {shlex.quote(remote_path)}")
+        local_md5 = hashlib.md5(local.read_bytes()).hexdigest()
+        if out.split()[0] != local_md5:
+            fail("md5 mismatch after push!")
+            return False
+    else:
+        _, out, _ = ssh_exec(cli, f"find {shlex.quote(remote_path)} -type f | wc -l")
+        if int(out or -1) != want:
+            fail(f"file count mismatch after push (device {out}, local {want})")
+            return False
+    if make_exec:
+        ssh_exec(cli, f"chmod +x {shlex.quote(remote_path)}")
+    ok(f"pushed {local} -> {remote_path} (verified)")
+    show_device_screen(cli, "operation-done")
+    return True
+
+
+def device_list_dir(cli, path):
+    """[(name, is_dir)] for a device path, dirs sorted first. None = bad path."""
+    rc, out, err = ssh_exec(cli, f"ls -A1p {shlex.quote(path)} 2>/dev/null")
+    if rc != 0:
+        return None
+    entries = []
+    for line in out.splitlines():
+        if not line:
+            continue
+        if line.endswith("/"):
+            entries.append((line.rstrip("/"), True))
+        else:
+            entries.append((line, False))
+    return sorted(entries, key=lambda e: (not e[1], e[0].lower()))
+
+
+def flow_browse_pull(cli, out_dir="pulled"):
+    """Arrow-key file browser over the device filesystem. Enter on a folder
+    opens it, enter on a file pulls it straight away."""
+    start = prompt("start browsing at:", "/") or "/"
+    path = start
+    while True:
+        entries = device_list_dir(cli, path)
+        if entries is None:
+            fail(f"can't list {path}, jumping back to {start}")
+            pause()
+            path = start
+            continue
+        opts = [f"Pull this whole folder ({path})", ".. (up)"]
+        opts += [n + ("/" if d else "") for n, d in entries]
+        sel = menu("Files: browse", opts, info_lines=[
+            f"device path: {BOLD}{path}{RESET}",
+            f"{DIM}enter on a folder = open it, enter on a file = pull it{RESET}",
+            f"{DIM}pulls land in {out_dir}/{RESET}",
+        ])
+        if sel == -1:
+            return
+        if sel == 0:
+            pull_from_device(cli, path, out_dir)
+            pause()
+            continue
+        if sel == 1:
+            if path.rstrip("/") == "":
+                continue  # already at /
+            parent = str(PurePosixPath(path).parent)
+            path = parent if parent != "" else "/"
+            continue
+        name, is_dir = entries[sel - 2]
+        full = path.rstrip("/") + "/" + name
+        if is_dir:
+            path = full
+            continue
+        clear()
+        banner()
+        print()
+        pull_from_device(cli, full, out_dir)
+        pause()
+
+
+def flow_files():
+    clear()
+    banner()
+    print(f"  {BOLD}{MAGENTA}Files (push / pull over ssh){RESET}\n")
+    up, authed = probe_root()
+    if not authed:
+        fail("root required (run Rooting first)")
+        pause()
+        return
+    try:
+        cli = ssh_connect()
+    except Exception as e:
+        fail(f"ssh failed: {e}")
+        pause()
+        return
+    try:
+        while True:
+            sel = menu("Files", [
+                "Browse device & pull (file browser)",
+                "Pull a path (type it in)",
+                "Push file/folder to device",
+                "Back",
+            ], info_lines=[
+                f"{DIM}pulls land in pulled/ (device path becomes the subfolder).{RESET}",
+                f"{DIM}pushes stream a tar into the device, md5-verified for files.{RESET}",
+            ])
+            if sel in (-1, 3):
+                return
+            clear()
+            banner()
+            print()
+            if sel == 0:
+                flow_browse_pull(cli)
+            elif sel == 1:
+                remote = prompt("remote path to pull:", "/WEBSERVER")
+                if not remote:
+                    continue
+                out = prompt("local folder:", "pulled")
+                pull_from_device(cli, remote, out)
+            elif sel == 2:
+                local = prompt("local file/folder to push:")
+                if not local or not Path(local).exists():
+                    fail(f"{local or '(empty)'} not found")
+                    pause()
+                    continue
+                remote = prompt("remote destination path (full path):")
+                if not remote:
+                    continue
+                warn(f"this overwrites {remote} on the device.")
+                warn("init scripts are fine (restore from .pre-root), but never")
+                warn("write into the flash partitions - those are mtd, not files.")
+                if menu("Push now?", ["Cancel", "Push"]) != 1:
+                    continue
+                make_exec = menu("Make it executable (chmod +x)?",
+                                 ["No", "Yes (for scripts)"]) == 1
+                push_to_device(cli, local, remote, make_exec=make_exec)
+            pause()
+    finally:
+        cli.close()
 
 
 def get_local_ip():
@@ -416,9 +697,10 @@ def flow_root(state):
 
     local_ip = get_local_ip()
     info(f"your LAN IP (payload server): {local_ip}:{PAYLOAD_PORT}")
-    warn("default admin password = the default WiFi password (also shown in")
-    warn("WebUI > Settings > Advanced > Advanced).")
+    warn("default admin password = the default WiFi password (also shown on the device in")
+    warn("Menu > Settings > Advanced Settings).")
     admin_pw = getpass.getpass("  admin password: ")
+    info("logging into the WebUI...")
 
     session = requests.Session()
     oklogin, msg = web_login(session, admin_pw)
@@ -436,6 +718,7 @@ def flow_root(state):
 
     try:
         # ---- stage 1: plant /tmp/root.sh
+        info("uploading stage 1...")
         token = vpn_token(session)
         if not token:
             fail("could not scrape gSecureToken from /vpn/. are you logged in?")
@@ -445,25 +728,29 @@ def flow_root(state):
         r = vpn_upload(session, token, "mifi_stage1.ovpn", stage1)
         info(f"stage 1 uploaded (HTTP {r.status_code})")
         token = vpn_token(session)
+        info("executing stage 1...")
         vpn_connect(session, token)
-        info("connect requested, waiting for the device to fetch the payload...")
+        ok("stage 1 executed! waiting for the device to fetch the payload...")
 
         if not ps.fetched.wait(30):
-            fail("device never fetched /payload/root.sh within 30 seconds, aborting")
+            fail("device didn't fetch payload within 30 seconds, aborting")
             fail("the device needs an internet connection (cellular data) to")
             fail("reach the VPN server. without the handshake there is no payload.")
             fail("other causes: VPN server down, firewall blocking :8000, wrong IP")
             return
-        ok("payload downloaded to /tmp/root.sh")
+        ok("device fetched the payload!")
 
         # ---- stage 2: execute it
         token = vpn_token(session)
+        info("preparing to execute stage 2...")
         vpn_clear(session, token)
         token = vpn_token(session)
+        info("uploading stage 2...")
         vpn_upload(session, token, "mifi_stage2.ovpn", stage2)
         token = vpn_token(session)
+        info("executing stage 2...")
         vpn_connect(session, token)
-        info("stage 2 connect requested, payload executes on the TLS handshake...")
+        ok("stage 2 executed! waiting for ssh...")
 
         # ---- wait for dropbear
         for i in range(45):
@@ -472,7 +759,7 @@ def flow_root(state):
                 break
             time.sleep(2)
         if not authed:
-            fail("dropbear never came up, check the VPN log in the WebUI")
+            fail("uh oh, ssh never came up, check the VPN log in the WebUI")
             return
 
         ok(f"root acquired! ssh -p 2222 root@{HOST} (password {ROOT_PW})")
@@ -485,21 +772,33 @@ def flow_root(state):
         fail(f"ssh dropped: {e}")
         pause()
         return
+    # first ssh of the rooting process: tell the human on the device that
+    # the tool is still working (persistence question comes up next)
+    show_device_screen(cli, "inprogress")
     sel = menu("Install root persistence now?",
                ["Yes (survives reboots)", "No (later)"], info_lines=[])
-    if sel == 0:
-        flow_persistence(cli)
-    show_success_image(cli)
+    # the user may have sat at that menu while dropbear restarted underneath us
+    cli = ssh_ensure(cli)
+    if not cli:
+        pause()
+        return
+    if sel == 0 and flow_persistence(cli):
+        show_device_screen(cli, "success")
+    else:
+        show_device_screen(cli, "temproot-success")
     cli.close()
     pause()
 
 
-def show_success_image(cli):
-    """Display assets/success.png on the 320x240 screen. The Yay! button is
-    positioned right over the device UI's connected-devices button, so tapping
-    it opens the menu through the touch layer, no ssh needed afterwards."""
-    src = Path("assets/success.png")
+def show_device_screen(cli, name):
+    """Push assets/<name>.png to the device and put it on the 320x240 screen.
+    Silent on success - the device screen IS the feedback. The success image
+    has its Yay! button positioned right over the device UI's
+    connected-devices button, so tapping it opens the menu through the touch
+    layer, no ssh needed afterwards."""
+    src = Path("assets") / f"{name}.png"
     if not src.exists():
+        warn(f"{src} missing, skipping the {name} screen")
         return
     data = src.read_bytes()
     if data[25] == 6:  # RGBA. mifi_display_png only accepts RGB
@@ -510,12 +809,28 @@ def show_success_image(cli):
             Image.open(src).convert("RGB").save(buf, "PNG")
             data = buf.getvalue()
         except ImportError:
-            warn("success.png is RGBA and PIL isn't installed, skipping (pip install pillow)")
+            warn(f"{name}.png is RGBA and PIL isn't installed, skipping (pip install pillow)")
             return
     ssh_exec(cli, "mkdir -p /data/yay")
     if push_bytes(cli, "/data/yay/yay_1.png", data) == 0:
         ssh_exec(cli, "LD_LIBRARY_PATH=/opt/nvtl/lib /opt/nvtl/bin/mifi_display_png /data/yay/yay_ 1")
-        ok("success screen is up, tap the Yay! button")
+
+
+PERSISTENCE_MARKER = "# --- root persistence (added by mifi_tool) ---"
+PERSISTENCE_FILES = [
+    "/opt/nvtl/bin/init-SDX65.sh",     # SDX65 (M3000/M3100/M3200)
+    "/opt/nvtl/bin/init-SDX55.sh",     # SDX55 (M2000)
+    "/opt/nvtl/bin/syslogd_monitor.sh",
+]
+
+
+def persistence_installed(cli):
+    """True if our persistence block is live in any of the init scripts."""
+    for cand in PERSISTENCE_FILES:
+        _, out, _ = ssh_exec(cli, f"grep -cF '{PERSISTENCE_MARKER}' {cand} 2>/dev/null")
+        if out and out != "0":
+            return True
+    return False
 
 
 def flow_unroot(cli):
@@ -527,12 +842,8 @@ def flow_unroot(cli):
     warn("only reachable over serial/console. The WebUI is untouched.")
     if menu("Continue?", ["Cancel", "Uninstall"]) != 1:
         return
-    MARKER = "# --- root persistence (added by mifi_tool) ---"
-    CANDIDATES = [
-        "/opt/nvtl/bin/init-SDX65.sh",
-        "/opt/nvtl/bin/init-SDX55.sh",
-        "/opt/nvtl/bin/syslogd_monitor.sh",
-    ]
+    MARKER = PERSISTENCE_MARKER
+    CANDIDATES = PERSISTENCE_FILES
     target = None
     for cand in CANDIDATES:
         _, out, _ = ssh_exec(cli, f"[ -f {cand} ] && echo yes")
@@ -564,19 +875,18 @@ def flow_unroot(cli):
             fail("failed to clean init script. DO NOT reboot")
             return
         ok(f"persistence block stripped from {target}")
-    # kill services last. dropping dropbear kills our own ssh session, so
-    # detach the kill into a background sleep to let the response go out first
+    # put the unroot screen up while ssh still works, then kill services last.
+    # dropping dropbear kills our own ssh session, so detach the kill into a
+    # background sleep to let the response go out first
+    show_device_screen(cli, "unroot-success")
     ssh_exec(cli, "nohup sh -c 'sleep 1; kill $(pidof dropbear) $(pidof telnetd)' >/dev/null 2>&1 &")
     ok("root uninstalled. ssh/telnet are down, device behaves as stock")
 
 
 def flow_persistence(cli):
-    MARKER = "# --- root persistence (added by mifi_tool) ---"
-    CANDIDATES = [
-        "/opt/nvtl/bin/init-SDX65.sh",     # SDX65 (M3000/M3100/M3200)
-        "/opt/nvtl/bin/init-SDX55.sh",     # SDX55 (M2000)
-        "/opt/nvtl/bin/syslogd_monitor.sh",
-    ]
+    """Returns True only if persistence is verifiably installed afterwards."""
+    MARKER = PERSISTENCE_MARKER
+    CANDIDATES = PERSISTENCE_FILES
     block = [
         MARKER,
         'echo -e "Root@123\\nRoot@123" | passwd root',
@@ -590,12 +900,12 @@ def flow_persistence(cli):
             break
     if not target:
         fail(f"none of {CANDIDATES} exist on this device")
-        return
+        return False
 
     _, raw, _ = ssh_exec(cli, f"cat {target}")
     if MARKER in raw:
         ok(f"persistence already present in {target}")
-        return
+        return True
     lines = [l for l in raw.splitlines()
              if l.strip() != MARKER
              and "passwd root" not in l
@@ -614,12 +924,14 @@ def flow_persistence(cli):
     rc = chan.recv_exit_status()
     if rc != 0:
         fail("failed to write init script. persistence NOT installed")
-        return
+        return False
     _, out, _ = ssh_exec(cli, f"grep -c dropbear {target}")
     if int(out or 0) >= 1:
         ok(f"persistence installed in {target} (backup: {target}.pre-root)")
+        return True
     else:
         fail("verification failed. DO NOT reboot until this is fixed")
+        return False
 
 
 def flow_backup():
@@ -650,6 +962,8 @@ def flow_backup():
     warn("these dumps are your ONLY recovery path (no firehose exists).")
     warn("copy the backup/ folder somewhere safe when this finishes.\n")
 
+    show_device_screen(cli, "operation-inprogress")
+
     bad = 0
     for num, size, name in parts:
         out = out_dir / f"mtd{num}_{name}.bin"
@@ -669,11 +983,12 @@ def flow_backup():
         else:
             print(f"{GREEN}ok{RESET}")
 
-    cli.close()
     if bad:
         fail(f"{bad} partitions failed, re-run the backup")
     else:
         ok(f"all {len(parts)} partitions dumped to {out_dir}/, zero warnings")
+        show_device_screen(cli, "operation-done")
+    cli.close()
     pause()
 
 
@@ -741,7 +1056,20 @@ def flow_ssh_shell():
         # falls back to the password prompt instead of dying
         cmd += ["-i", str(key), "-o", "IdentitiesOnly=yes"]
     cmd.append(f"root@{HOST}")
+
+    def _screen(name):
+        # screen pushes are best-effort: a failed connect shouldn't block
+        # the shell itself
+        try:
+            cli = ssh_connect()
+            show_device_screen(cli, name)
+            cli.close()
+        except Exception:
+            pass
+
+    _screen("operation-inprogress")
     subprocess.call(cmd)
+    _screen("operation-done")
 
 
 # ------------------------------------------------------------- tweaks -------
@@ -822,6 +1150,7 @@ def duck_install(cli):
     clear()
     banner()
     print(f"  {BOLD}{MAGENTA}Duck install{RESET}\n")
+    show_device_screen(cli, "operation-inprogress")
     ssh_exec(cli, "mkdir -p /data/duck")
     pushed = 0
     for f in frames:
@@ -844,6 +1173,7 @@ def duck_install(cli):
         pause()
         return
     ok(f"duck installed ({pushed} frames pushed, frames and script survive reboots)")
+    show_device_screen(cli, "operation-done")
     pause()
 
 
@@ -879,6 +1209,10 @@ def flow_duck(cli, installed):
 
 def tweak_submenu(cli):
     while True:
+        # the connection may have died while we sat at the menu
+        cli = ssh_ensure(cli)
+        if not cli:
+            return
         installed = duck_installed(cli)
         opts = [
             "Device / modem info (ATI)",
@@ -889,13 +1223,14 @@ def tweak_submenu(cli):
             "Set enabled NR5G bands (EXPERIMENTAL)",
             "5G radio enable/disable (EXPERIMENTAL)",
             "Duck (installed)" if installed else "Install duck",
+            "Show about screen",
             "Reboot device",
             "Back",
         ]
         sel = menu("Tweaks", opts, info_lines=[
             f"{DIM}modem2_cli has ~300 commands, see modem2_cli_help.txt{RESET}",
         ])
-        if sel in (-1, 9):
+        if sel in (-1, 10):
             return
         clear()
         banner()
@@ -927,11 +1262,13 @@ def tweak_submenu(cli):
                 fail("(to cancel, just press enter at the prompt)")
             else:
                 blist = bands.split()
+                show_device_screen(cli, "operation-inprogress")
                 for kind in ("nsa", "sa"):
                     out = modem2_set_nr5g_bands(cli, kind, blist)
                     print(f"{kind}: {out or '(no output)'}")
                 _, out, _ = ssh_exec(cli, f"{MODEM2} get_enabled_nr5g_nsa_bands")
                 print(out)
+                show_device_screen(cli, "operation-done")
                 warn("if the modem dropped service, set your old bands back or reboot")
         elif sel == 6:
             warn("experimental: argument format undocumented (0=off, 1=on expected)")
@@ -942,12 +1279,14 @@ def tweak_submenu(cli):
         elif sel == 7:
             flow_duck(cli, installed)
         elif sel == 8:
+            show_device_screen(cli, "about")
+        elif sel == 9:
             if menu("Reboot device?", ["Cancel", "Reboot"]) == 1:
                 ssh_exec(cli, "reboot")
                 ok("rebooting, ssh will drop")
                 pause()
                 return
-        if sel not in (-1, 8, 9):
+        if sel not in (-1, 9, 10):
             pause()
 
 
@@ -956,7 +1295,7 @@ def tweak_submenu(cli):
 def main():
     clear()
     banner()
-    info("checking for the MiFi WebUI...")
+    info("connecting...")
     good, msg = check_server()
     if not good:
         clear()
@@ -974,28 +1313,40 @@ def main():
     local_ip = get_local_ip()
     up, authed = probe_root()
 
+    perm = None  # None = not probed yet, True/False = persistence state
     while True:
-        status = (f"{GREEN}root active{RESET}" if authed else
+        if authed and perm is None:
+            try:
+                cli = ssh_connect()
+                perm = persistence_installed(cli)
+                cli.close()
+            except Exception:
+                perm = None
+        status = (f"{GREEN}root active (persistent){RESET}" if authed and perm else
+                  f"{GREEN}root active (TEMPORARY!){RESET}" if authed else
                   f"{YELLOW}ssh up, auth unknown{RESET}" if up else
                   f"{DIM}no root (stock){RESET}")
         state = {"authed": authed}
         sel = menu(f"{model}: main menu",
-                   ["Rooting", "Backup", "Tweaks", "SSH shell", "Exit"],
+                   ["Rooting", "Backup", "Files", "Tweaks", "SSH shell", "Exit"],
                    info_lines=[
                        f"device:    {BOLD}{model}{RESET}   status: {status}",
                        f"device:    {HOST}   your LAN IP: {local_ip}",
                        f"payload:   {PAYLOAD_LOCAL} (served on :{PAYLOAD_PORT})",
                    ])
         try:
-            if sel in (-1, 4):
+            if sel in (-1, 5):
                 clear()
                 return
             if sel == 0:
                 root_menu(state)
                 up, authed = probe_root()
+                perm = None  # rooting may have changed persistence, re-probe
             elif sel == 1:
                 flow_backup()
             elif sel == 2:
+                flow_files()
+            elif sel == 3:
                 if not authed:
                     clear()
                     banner()
@@ -1005,7 +1356,7 @@ def main():
                     cli = ssh_connect()
                     tweak_submenu(cli)
                     cli.close()
-            elif sel == 3:
+            elif sel == 4:
                 if not authed:
                     clear()
                     banner()
@@ -1040,7 +1391,9 @@ def root_menu(state):
                 fail(f"ssh failed: {e}")
                 pause()
                 continue
-            flow_persistence(cli)
+            if ssh_ensure(cli):
+                if flow_persistence(cli):
+                    show_device_screen(cli, "rootpersistence-success")
             cli.close()
             pause()
         elif sel == 2:
@@ -1050,13 +1403,25 @@ def root_menu(state):
                 fail(f"ssh failed: {e}")
                 pause()
                 continue
-            flow_unroot(cli)
+            if ssh_ensure(cli):
+                flow_unroot(cli)
             cli.close()
             pause()
         elif sel == 3:
             up, authed = probe_root()
             if authed:
                 ok(f"root SSH is up on :{SSH_PORT} and {ROOT_PW} works")
+                try:
+                    cli = ssh_connect()
+                    if persistence_installed(cli):
+                        ok("persistence is installed - root is permanent")
+                        show_device_screen(cli, "you-are-rooted")
+                    else:
+                        warn("no persistence found - this root dies on reboot")
+                        show_device_screen(cli, "you-are-temp-rooted")
+                    cli.close()
+                except Exception as e:
+                    fail(f"ssh failed: {e}")
             elif up:
                 warn(f"ssh is up but {ROOT_PW} was rejected (rooted with another tool or password changed?)")
             else:
