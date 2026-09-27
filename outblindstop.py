@@ -14,16 +14,21 @@ import functools
 import getpass
 import hashlib
 import http.server
+import io
+import json
 import os
 import re
 import shlex
+import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
 import threading
 import time
+import zipfile
 from pathlib import Path, PurePosixPath
 
 import paramiko
@@ -60,7 +65,8 @@ def clear():
 
 
 def banner():
-    print(f"""{CYAN}{BOLD}
+    # raw string: the ASCII art contains backslashes that aren't escapes
+    print(rf"""{CYAN}{BOLD}
               _   _     _ _           _     _              
    ___  _   _| |_| |__ | (_)_ __   __| |___| |_ ___  _ __  
   / _ \| | | | __| '_ \| | | '_ \ / _` / __| __/ _ \| '_ \ 
@@ -167,6 +173,84 @@ def prompt(msg, default=None):
     except EOFError:
         return default
     return val or default
+
+
+def multi_menu(title, options, info_lines=()):
+    """Checkbox menu: space toggles, enter confirms, Ctrl+C cancels.
+    Returns the chosen option strings (possibly empty). Enter with nothing
+    ticked does NOT exit - too easy to fat-finger enter expecting radio
+    behaviour and have the whole flow vanish without a word."""
+    if os.name == "nt":
+        import msvcrt
+        getch = msvcrt.getch
+    else:
+        getch = None
+    picked = set()
+    sel = 0
+    hint = ""
+    while True:
+        clear()
+        banner()
+        print(f"{BOLD}{MAGENTA}  {title}{RESET}\n")
+        for line in info_lines:
+            print(f"  {line}")
+        print()
+        for i, opt in enumerate(options):
+            box = "[x]" if i in picked else "[ ]"
+            if i == sel:
+                print(f"  {CYAN}{BOLD} > {box} {opt}{RESET}")
+            else:
+                print(f"    {DIM}{box} {opt}{RESET}")
+        if hint:
+            print(f"\n  {YELLOW}{hint}{RESET}")
+        print(f"\n  {DIM}[arrows] move   [space] toggle   [enter] done   [ctrl+c] back{RESET}")
+        if os.name == "nt":
+            ch = getch()
+            if ch in (b"\x00", b"\xe0"):
+                arrow = getch().decode(errors="ignore")
+                key = {"H": "up", "P": "down"}.get(arrow, "")
+            elif ch == b"\r":
+                key = "enter"
+            elif ch == b"\x03":
+                return []
+            elif ch == b" ":
+                key = "space"
+            else:
+                key = ""
+        else:
+            import termios
+            import tty
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                ch = sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            if ch == "\x1b":
+                key = {"A": "up", "B": "down"}.get(sys.stdin.read(1), "")
+            elif ch in ("\r", "\n"):
+                key = "enter"
+            elif ch == "\x03":
+                return []
+            elif ch == " ":
+                key = "space"
+            else:
+                key = ""
+        if key == "up":
+            sel = (sel - 1) % len(options)
+            hint = ""
+        elif key == "down":
+            sel = (sel + 1) % len(options)
+            hint = ""
+        elif key == "space":
+            picked.symmetric_difference_update({sel})
+            hint = ""
+        elif key == "enter":
+            if not picked:
+                hint = "nothing ticked yet - press space on the items you want"
+                continue
+            return [options[i] for i in sorted(picked)]
 
 
 def pause(msg="press enter to continue"):
@@ -316,9 +400,12 @@ def push_to_device(cli, local_path, remote_path, make_exec=False):
     file lands exactly where you asked."""
     local = Path(local_path)
     remote_path = remote_path.rstrip("/")
-    base = str(Path(remote_path).parent)
-    arcname = Path(remote_path).name if local.is_file() else (
-        Path(remote_path).name or local.name)
+    # PurePosixPath, NOT Path: on Windows, Path() would rewrite the remote
+    # path with backslashes, and busybox mkdir/tar would then create a
+    # literal '\opt\...' directory in $HOME instead of the real target
+    base = str(PurePosixPath(remote_path).parent)
+    arcname = PurePosixPath(remote_path).name if local.is_file() else (
+        PurePosixPath(remote_path).name or local.name)
 
     show_device_screen(cli, "operation-inprogress")
     cmd = f"mkdir -p {shlex.quote(base)} && tar xzf - -C {shlex.quote(base)}"
@@ -783,6 +870,19 @@ def flow_root(state):
         pause()
         return
     if sel == 0 and flow_persistence(cli):
+        persisted = True
+    else:
+        persisted = False
+    # rooting extra: offer a stock animation backup + the bundled
+    # outblindstop animation while we have root right here
+    cli = ssh_ensure(cli)
+    if cli:
+        cli = flow_root_startup_offer(cli)
+        cli = ssh_ensure(cli) if cli else None
+    if not cli:
+        pause()
+        return
+    if persisted:
         show_device_screen(cli, "success")
     else:
         show_device_screen(cli, "temproot-success")
@@ -1207,6 +1307,785 @@ def flow_duck(cli, installed):
             return
 
 
+# ------------------------------------------- startup, screens and spinners --
+
+# All of this lives in persistent data (/opt/nvtl/data/branding is NOT
+# re-extracted at boot unless a branding.tgz/ipk is present, so edits here
+# survive reboots). The boot animation is replayed by
+# mifi_display_animation.service; the power/restart/reset screens and the
+# loading spinners are static assets read by devuiappd out of deviceui/.
+STARTUP_DIR = "/opt/nvtl/data/branding/startup"
+IMAGES_DIR = "/opt/nvtl/data/branding/deviceui/images"
+STARTUP_LOCAL = Path("startup")
+BUNDLED_STARTUP_ZIP = STARTUP_LOCAL / "outblindstop startup.zip"
+BUNDLED_SCREENS_DIR = Path.home() / "Downloads" / "outblindstop off screens"
+STOCK_DELAY_US = 18000          # stock: 89 frames, 18 ms/frame (~55.6 fps)
+ANIM_W, ANIM_H = 320, 240
+
+# Loose-file install aliases: short custom names map onto the stock files
+# devuiappd actually reads (MIFIScreen_*) plus the legacy sprint_* copies so
+# both sets stay consistent no matter which path the UI takes.
+SCREEN_ALIASES = {
+    "poweroff.png": ("DeviceImages_DeviceUI_MIFIScreen_OFF.png",
+                     "sprint_powering_off.png"),
+    "power_off.png": ("DeviceImages_DeviceUI_MIFIScreen_OFF.png",
+                      "sprint_powering_off.png"),
+    "shutdown.png": ("DeviceImages_DeviceUI_MIFIScreen_OFF.png",
+                     "sprint_powering_off.png"),
+    "restart.png": ("DeviceImages_DeviceUI_MIFIScreen_Restart.png",
+                    "sprint_restarting.png"),
+    "reboot.png": ("DeviceImages_DeviceUI_MIFIScreen_Restart.png",
+                   "sprint_restarting.png"),
+    "reset.png": ("DeviceImages_DeviceUI_MIFIScreen_Reset.png",
+                  "sprint_resetting.png"),
+}
+
+# Copy of the stock mifi_display_animation.sh with NUM_FILES/USLEEP swapped
+# out, so zips without a bundled script still get the exact stock boot-time
+# behaviour (frame caching into the page cache + chrt realtime priority).
+ANIM_SH = """#!/bin/sh
+#
+# splash_animation
+#
+
+export PATH=$PATH:/opt/nvtl/bin
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/nvtl/lib
+
+BASE_PATH=/opt/nvtl/data/branding/startup/animation_
+NUM_FILES=__NUM_FILES__
+USLEEP=__USLEEP__
+
+cache_files()
+{
+    COUNT=1
+    while [ $COUNT -lt $NUM_FILES ]; do
+        dd if=$BASE_PATH$COUNT.png of=/dev/null bs=32K > /dev/null 2>&1
+        let COUNT=COUNT+1
+    done
+}
+
+case $1 in
+    start)
+        echo "power on animation cache files started" > /dev/kmsg
+        cache_files
+        echo "[MIFI_TIMESTAMP] - power on animation started" > /dev/kmsg
+        chrt -f 1 /opt/nvtl/bin/mifi_display_png $BASE_PATH $NUM_FILES $USLEEP &
+        ;;
+    stop)
+        echo "stopping splashscreen animation"
+        killall -q mifi_display_png
+        ;;
+esac
+"""
+
+
+def _frame_num(name):
+    m = re.search(r"(\d+)", Path(name).stem)
+    return int(m.group(1)) if m else 0
+
+
+def startup_params(cli):
+    """(num_frames, delay_us, script_text_or_None) as currently on device."""
+    rc, script, _ = ssh_exec(cli, f"cat {STARTUP_DIR}/mifi_display_animation.sh 2>/dev/null")
+    num = re.search(r"NUM_FILES=(\d+)", script)
+    delay = re.search(r"USLEEP=(\d+)", script)
+    n = int(num.group(1)) if num else None
+    d = int(delay.group(1)) if delay else STOCK_DELAY_US
+    if n is None:
+        _, out, _ = ssh_exec(cli, f"ls {STARTUP_DIR}/animation_*.png 2>/dev/null | wc -l")
+        try:
+            n = int(out)
+        except ValueError:
+            n = 0
+    return n, d, (script if rc == 0 else None)
+
+
+def _startup_pull(cli, dest_dir):
+    """Stream the animation dir off the device into dest_dir. Returns the
+    local frame paths (or None on failure). Only plain animation files are
+    unpacked, so device symlinks/dev nodes can never trip the extractor."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    _, stdout, _ = cli.exec_command(f"tar czf - {shlex.quote(STARTUP_DIR)}")
+    tarball = dest_dir / "_startup.tar.gz"
+    with open(tarball, "wb") as f:
+        while True:
+            chunk = stdout.read(1 << 16)
+            if not chunk:
+                break
+            f.write(chunk)
+    if stdout.channel.recv_exit_status() != 0 or tarball.stat().st_size == 0:
+        fail(f"tar failed on device - does {STARTUP_DIR} exist?")
+        return None
+    expected = STARTUP_DIR.strip("/")
+    frames = []
+    with tarfile.open(tarball, "r:gz") as tf:
+        for m in tf.getmembers():
+            if not m.isfile():
+                continue
+            rel = m.name[2:] if m.name.startswith("./") else m.name
+            if not (rel == expected or rel.startswith(expected + "/")):
+                fail(f"unexpected path in tar, refusing to extract: {m.name}")
+                return None
+            base = rel[len(expected):].lstrip("/")
+            if base != "mifi_display_animation.sh" and not \
+                    (base.startswith("animation_") and base.endswith(".png")):
+                continue
+            target = dest_dir / base
+            with tf.extractfile(m) as src, open(target, "wb") as out:
+                out.write(src.read())
+            if base.startswith("animation_"):
+                frames.append(target)
+    tarball.unlink()
+    return frames
+
+
+def _pack_startup_zip(zip_path, frame_files, script_text, delay_us, origin,
+                      extra_files=()):
+    """Bundle frames + the player script + a metadata file (frame count and
+    per-frame delay) so the zip is self-describing at install time.
+    extra_files are (arcname, bytes) pairs for loose deviceui assets
+    (power-off screens, spinners) stored under images/ in the zip."""
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "format": "mifi-startup-animation",
+        "num_frames": len(frame_files),
+        "delay_us": int(delay_us),
+        "resolution": f"{ANIM_W}x{ANIM_H}",
+        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "origin": origin,
+        "images": sorted(a for a, _ in extra_files),
+    }
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("metadata.json", json.dumps(meta, indent=2))
+        for f in sorted(frame_files, key=lambda p: _frame_num(p.name)):
+            # normalise the arcnames to animation_<n>.png (1-indexed) so the
+            # stock player script always finds what it expects
+            zf.write(f, f"animation_{_frame_num(f.name)}.png")
+        zf.writestr("mifi_display_animation.sh", script_text)
+        for arcname, data in extra_files:
+            zf.writestr(f"images/{arcname}", data)
+    return meta
+
+
+# Static deviceui assets covered by the backup alongside the boot frames.
+# Power-off/restart/reset are the ones devuiappd reads (plus legacy
+# sprint_* twins); the spinners are devuiappd loading indicators. The whole
+# set is ~200 kB so bundling it with every backup costs nothing.
+BACKUP_IMAGES = [
+    "DeviceImages_DeviceUI_MIFIScreen_OFF.png",
+    "DeviceImages_DeviceUI_MIFIScreen_Restart.png",
+    "DeviceImages_DeviceUI_MIFIScreen_Reset.png",
+    "sprint_powering_off.png",
+    "sprint_restarting.png",
+    "sprint_resetting.png",
+    "activity-spinner.gif",
+    "init-activity-spinner.gif",
+    "startup-activity-spinner.gif",
+    "activity_animation_red.gif",
+    "ucf_animation.gif",
+]
+
+# Selectable install/restore groups. "screens" also accepts the short
+# custom names in SCREEN_ALIASES; spinner matching is substring-based so
+# current and future spinner GIFs all land in one group.
+IMAGE_GROUPS = [
+    ("Power-off screen", "DeviceImages_DeviceUI_MIFIScreen_OFF.png"),
+    ("Restart screen", "DeviceImages_DeviceUI_MIFIScreen_Restart.png"),
+    ("Reset screen", "DeviceImages_DeviceUI_MIFIScreen_Reset.png"),
+    ("Loading spinners", "spinner"),
+]
+
+
+def _group_label_for(arcname):
+    base = (arcname.split("/", 1)[1] if "/" in arcname else arcname).lower()
+    if "spinner" in base or "ucf_animation" in base:
+        return "Loading spinners"
+    if "off" in base or "power" in base or "shutdown" in base:
+        return "Power-off screen"
+    if "restart" in base or "reboot" in base:
+        return "Restart screen"
+    if "reset" in base:
+        return "Reset screen"
+    return base
+
+
+def _cat_bytes(cli, remote):
+    """Raw bytes of a device file, or None. push/pull helpers only deal in
+    files and trees, and these are single small assets, so cat over the
+    exec channel is the cheapest reliable path."""
+    _, stdout, _ = cli.exec_command(f"cat {shlex.quote(remote)}")
+    data = stdout.read()
+    if stdout.channel.recv_exit_status() != 0 or not data:
+        return None
+    return bytes(data)
+
+
+def startup_backup(cli):
+    """Pull the boot animation plus the power/spinner images off the device
+    and pack them into a timestamped zip in startup/."""
+    zip_path = STARTUP_LOCAL / f"animation-backup-{time.strftime('%Y%m%d-%H%M%S')}.zip"
+    show_device_screen(cli, "operation-inprogress")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = Path(tmp)
+        frames = _startup_pull(cli, tmpdir)
+        if not frames:
+            fail(f"no animation frames found in {STARTUP_DIR}")
+            return None
+        script_file = tmpdir / "mifi_display_animation.sh"
+        script_text = (script_file.read_text(errors="replace")
+                       if script_file.exists() else ANIM_SH)
+        m = re.search(r"USLEEP=(\d+)", script_text)
+        delay = int(m.group(1)) if m else STOCK_DELAY_US
+        extra = []
+        for name in BACKUP_IMAGES:
+            data = _cat_bytes(cli, f"{IMAGES_DIR}/{name}")
+            if data:
+                extra.append((name, data))
+            else:
+                warn(f"{name} not found on device, skipping")
+        meta = _pack_startup_zip(zip_path, frames, script_text, delay,
+                                 f"backup of {STARTUP_DIR} + deviceui images on {HOST}",
+                                 extra_files=extra)
+    show_device_screen(cli, "operation-done")
+    ok(f"backed up {meta['num_frames']} frames + {len(meta.get('images', []))} images "
+       f"({meta['delay_us'] / 1000:.1f} ms/frame) -> {zip_path}")
+    return zip_path
+
+
+def _prepare_frame_bytes(data):
+    """mifi_display_png only accepts 320x240 RGB (colortype 2) PNGs. Clean
+    frames pass through untouched, anything else gets fixed up with PIL."""
+    if len(data) > 26 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        w, h = struct.unpack(">II", data[16:24])
+        if (w, h) == (ANIM_W, ANIM_H) and data[25] == 2:
+            return data
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:
+        raise RuntimeError("frames need converting to 320x240 RGB but PIL is "
+                           "missing (pip install pillow)")
+    img = Image.open(io.BytesIO(data)).convert("RGB")
+    if img.size != (ANIM_W, ANIM_H):
+        img = ImageOps.pad(img, (ANIM_W, ANIM_H), color=(0, 0, 0))
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def _zip_image_names(names):
+    return sorted([n for n in names if n.startswith("images/")
+                   and not n.endswith("/")],
+                  key=lambda n: n.lower())
+
+
+def _image_targets(data, arcname):
+    """(device filename, bytes) pairs for one zip asset. Short custom names
+    (poweroff.png, restart.png) fan out to the stock files devuiappd reads
+    (MIFIScreen_*) plus the legacy sprint_* twins so both UI paths stay in
+    sync. Canonical device names install verbatim - fanning those out too
+    would let a zip's sprint_* twin overwrite the MIFIScreen_* file with
+    different artwork. GIF spinners install under their own name."""
+    base = arcname.split("/", 1)[1] if "/" in arcname else arcname
+    low = base.lower()
+    if low in SCREEN_ALIASES:
+        return [(t, data) for t in SCREEN_ALIASES[low]]
+    canonical = {t.lower() for group in SCREEN_ALIASES.values() for t in group}
+    if low in canonical:
+        return [(base, data)]
+    # unrecognised name derived from a canonical one (MIFIScreen_OFF_new.png):
+    # map it onto that group's files; anything else installs verbatim
+    for group in SCREEN_ALIASES.values():
+        stem = group[0].lower().replace("deviceimages_deviceui_", "") \
+                           .replace(".png", "")
+        if stem in low:
+            return [(t, data) for t in group]
+    return [(base, data)]
+
+
+def images_install(cli, zip_path, only=None, confirm=True):
+    """Install deviceui images (power screens, spinners) from a backup zip
+    or a folder of loose files. only limits to IMAGE_GROUPS labels
+    ("Power-off screen", ..., "Loading spinners"); None installs all."""
+    zp = Path(zip_path)
+    assets = []  # (arcname, bytes)
+    if zp.is_dir():
+        for f in sorted(zp.iterdir()):
+            if f.is_file() and f.suffix.lower() in (".png", ".gif"):
+                assets.append((f"images/{f.name}", f.read_bytes()))
+    else:
+        try:
+            zf = zipfile.ZipFile(zp)
+        except zipfile.BadZipFile:
+            fail(f"{zp} is not a valid zip or folder")
+            return False
+        with zf:
+            for n in _zip_image_names(zf.namelist()):
+                assets.append((n, zf.read(n)))
+    if not assets:
+        fail(f"no power screens or spinners found in {zp}")
+        return False
+    if only:
+        want = set(only)
+        assets = [a for a in assets
+                  if _group_label_for(a[0]) in want]
+        if not assets:
+            fail("none of the chosen items are in that bundle")
+            return False
+    targets = []
+    for arcname, data in assets:
+        targets.extend(_image_targets(data, arcname))
+    # spinner GIFs must stay GIFs; PNG screens get normalised so the
+    # framebuffer tool accepts them (stock is 320x240 RGB)
+    staged = []
+    try:
+        for name, data in targets:
+            if name.lower().endswith(".gif"):
+                staged.append((name, data))
+            else:
+                staged.append((name, _prepare_frame_bytes(data)))
+    except RuntimeError as e:
+        fail(str(e))
+        return False
+    if confirm:
+        clear()
+        banner()
+        print(f"  {BOLD}{MAGENTA}Screens & spinners install{RESET}\n")
+        print(f"  bundle:    {zp}")
+        for name, _ in staged:
+            print(f"    {IMAGES_DIR}/{name}")
+        print()
+        warn(f"this overwrites those files in {IMAGES_DIR}.")
+        if menu("Install these now?", ["Cancel", "Install"]) != 1:
+            return False
+    cli = ssh_ensure(cli)
+    if not cli:
+        return False
+    show_device_screen(cli, "operation-inprogress")
+    for name, data in staged:
+        if push_bytes(cli, f"{IMAGES_DIR}/{name}", data) != 0:
+            fail(f"push failed for {name}")
+            return False
+        local_md5 = hashlib.md5(data).hexdigest()
+        _, out, _ = ssh_exec(cli, f"md5sum {IMAGES_DIR}/{name}")
+        if not out or out.split()[0] != local_md5:
+            fail(f"md5 mismatch after push ({name})!")
+            return False
+    show_device_screen(cli, "operation-done")
+    ok(f"installed {len(staged)} screen/spinner file(s)")
+    info("screens apply immediately; spinners on next UI load")
+    return True
+
+
+def flow_images_install(cli):
+    """Install screens/spinners from a backup zip or the bundled folder,
+    with a per-group picker so restores can be selective."""
+    STARTUP_LOCAL.mkdir(exist_ok=True)
+    opts = []
+    if BUNDLED_SCREENS_DIR.exists():
+        opts.append(f"Bundled folder ({BUNDLED_SCREENS_DIR.name})")
+    zips = [z for z in sorted(STARTUP_LOCAL.glob("*.zip"))]
+    opts += [z.name for z in zips] + ["Type a path manually", "Back"]
+    sel = menu("Screens & spinners: choose source", opts, info_lines=[
+        "backups (animation-backup-*) carry the stock images too",
+    ])
+    if sel == -1 or opts[sel] == "Back":
+        return
+    if opts[sel] == "Type a path manually":
+        p = prompt("zip or folder path:")
+        if not p:
+            return
+        src = Path(p)
+        if not src.exists():
+            fail(f"{src} not found")
+            return
+    elif opts[sel].startswith("Bundled folder"):
+        src = BUNDLED_SCREENS_DIR
+    else:
+        src = zips[sel - (1 if BUNDLED_SCREENS_DIR.exists() else 0)]
+    labels = (["Boot animation"] + [label for label, _ in IMAGE_GROUPS]
+              + ["Everything"])
+    picked = multi_menu("Install which?", labels)
+    if not picked:
+        return
+    if "Everything" in picked:
+        picked = ["Boot animation"] + [label for label, _ in IMAGE_GROUPS]
+    if src.is_dir():
+        # loose folders only ever hold screens/spinners, never boot frames
+        if "Boot animation" in picked:
+            warn("folders hold screens/spinners only, no boot animation in there")
+        only = [p for p in picked if p != "Boot animation"]
+        if not only:
+            return
+        images_install(cli, src, only=only)
+    else:
+        startup_install(cli, src, parts=picked)
+
+
+def startup_pick_zip():
+    """Pick an animation zip from startup/ (or type any path)."""
+    STARTUP_LOCAL.mkdir(exist_ok=True)
+    zips = sorted(STARTUP_LOCAL.glob("*.zip"))
+    opts = [z.name for z in zips] + ["Type a path manually", "Back"]
+    sel = menu("Startup & animations: choose bundle", opts, info_lines= [
+        f"{len(zips)} bundle(s) in {STARTUP_LOCAL}/","{DIM}backups (animation-backup-*) and video conversions land there too{RESET}",
+    ])
+    if sel == -1 or opts[sel] == "Back":
+        return None
+    if opts[sel] == "Type a path manually":
+        p = prompt("zip path:")
+        if not p:
+            return None
+        p = Path(p)
+        if not p.exists():
+            fail(f"{p} not found")
+            return None
+        return p
+    return zips[sel]
+
+
+def startup_install(cli, zip_path, confirm=True, parts=None):
+    """Install from an animation bundle. Frames are normalised to the
+    format mifi_display_png demands, the player script's NUM_FILES and
+    USLEEP are forced to match, and the old frames are wiped first so a
+    shorter animation can't leave ghost frames behind. parts selects
+    bundle sections ({"Boot animation", ...} + IMAGE_GROUPS labels);
+    None installs everything. Old frame-only zips are treated as boot
+    animation only."""
+    zp = Path(zip_path)
+    try:
+        zf = zipfile.ZipFile(zp)
+    except zipfile.BadZipFile:
+        fail(f"{zp} is not a valid zip")
+        return False
+    with zf:
+        names = zf.namelist()
+        try:
+            meta = json.loads(zf.read("metadata.json").decode())
+        except (KeyError, ValueError):
+            meta = {}
+        frame_names = sorted([n for n in names if n.lower().endswith(".png")
+                              and not n.startswith("images/")],
+                             key=_frame_num)
+        image_names = _zip_image_names(names)
+        if not frame_names and not image_names:
+            fail(f"no frames or images found in {zp}")
+            return False
+        script_text = None
+        if "mifi_display_animation.sh" in names:
+            script_text = zf.read("mifi_display_animation.sh").decode(errors="replace")
+        # metadata wins for the delay unless the bundled script disagrees
+        delay = int(meta.get("delay_us") or STOCK_DELAY_US)
+        if script_text:
+            m = re.search(r"USLEEP=(\d+)", script_text)
+            if m:
+                delay = int(m.group(1))
+        num = len(frame_names)
+
+    want_boot = True
+    image_parts = None
+    if parts is not None:
+        want_boot = "Boot animation" in parts
+        image_parts = [p for p in parts if p != "Boot animation"]
+        if want_boot and not frame_names:
+            fail(f"{zp} has no boot animation frames")
+            return False
+        if image_parts and not image_names:
+            fail(f"{zp} has no screens/spinners (pre-feature backup?)")
+            return False
+    elif not frame_names:
+        want_boot = False
+
+    if confirm:
+        clear()
+        banner()
+        print(f"  {BOLD}{MAGENTA}Startup & animations install{RESET}\n")
+        print(f"  zip:       {zp}")
+        if frame_names:
+            print(f"  frames:    {num}")
+            print(f"  delay:     {delay / 1000:.1f} ms/frame ({1_000_000 / delay:.1f} fps)")
+            print(f"  duration:  {num * delay / 1e6:.2f} s")
+        if image_names:
+            print(f"  images:    {len(image_names)} screen/spinner file(s)")
+        print(f"  target:    {STARTUP_DIR}/ + {IMAGES_DIR}/ on the device\n")
+        warn(f"this overwrites the animation files in {STARTUP_DIR}.")
+        if not list(STARTUP_LOCAL.glob("animation-backup-*.zip")):
+            warn("no device backup exists yet - make one first so you can go back")
+            if menu("Backup now (animation + screens + spinners)?",
+                    ["Yes", "No (risky)"]) == 0 and not startup_backup(cli):
+                return False
+        if parts is None and frame_names and image_names:
+            seen = []
+            for n in image_names:
+                label = _group_label_for(n)
+                if label not in seen:
+                    seen.append(label)
+            picked = multi_menu("Install which parts?", [
+                "Boot animation",
+                *seen,
+            ])
+            if not picked:
+                return False
+            want_boot = "Boot animation" in picked
+            image_parts = [p for p in picked if p != "Boot animation"]
+            if not want_boot and not image_parts:
+                return False
+        elif menu("Install this bundle?", ["Cancel", "Install"]) != 1:
+            return False
+
+    cli = ssh_ensure(cli)
+    if not cli:
+        return False
+    booted = False
+    if want_boot and frame_names:
+        show_device_screen(cli, "operation-inprogress")
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = Path(tmp) / "startup"
+            stage.mkdir()
+            try:
+                with zipfile.ZipFile(zp) as zf:
+                    for i, name in enumerate(frame_names, 1):
+                        (stage / f"animation_{i}.png").write_bytes(
+                            _prepare_frame_bytes(zf.read(name)))
+            except RuntimeError as e:
+                fail(str(e))
+                return False
+            if script_text is None:
+                script_text = ANIM_SH
+            script_text = re.sub(r"NUM_FILES=\d+", f"NUM_FILES={num}", script_text)
+            script_text = re.sub(r"USLEEP=\d+", f"USLEEP={delay}", script_text)
+            if "__NUM_FILES__" in script_text:
+                # zip shipped an unbaked template - regenerate it rather than
+                # install a script the device shell can't run
+                script_text = (ANIM_SH.replace("__NUM_FILES__", str(num))
+                                      .replace("__USLEEP__", str(delay)))
+            # write BYTES with forced LF: text-mode write_text would translate
+            # to CRLF on Windows and busybox ash chokes on the \r characters
+            script_text = script_text.replace("\r\n", "\n").replace("\r", "\n")
+            (stage / "mifi_display_animation.sh").write_bytes(script_text.encode())
+            ssh_exec(cli, f"rm -f {STARTUP_DIR}/animation_*.png")
+            if not push_to_device(cli, stage, STARTUP_DIR):
+                return False
+            # trust nothing: verify frame 1 landed byte-for-byte
+            local_md5 = hashlib.md5((stage / "animation_1.png").read_bytes()).hexdigest()
+            _, out, _ = ssh_exec(cli, f"md5sum {STARTUP_DIR}/animation_1.png")
+            if not out or out.split()[0] != local_md5:
+                fail("md5 mismatch after push!")
+                return False
+        ssh_exec(cli, f"chmod +x {STARTUP_DIR}/mifi_display_animation.sh")
+        ok(f"installed: {num} frames, {delay / 1000:.1f} ms/frame")
+        show_device_screen(cli, "operation-done")
+        booted = True
+    if image_names and (image_parts or (parts is None and not confirm)):
+        with zipfile.ZipFile(zp) as zf:
+            raw = [(n, zf.read(n)) for n in image_names]
+        if image_parts is not None:
+            raw = [(n, d) for n, d in raw if _group_label_for(n) in image_parts]
+        if raw:
+            targets = []
+            for n, d in raw:
+                targets.extend(_image_targets(d, n))
+            staged = []
+            try:
+                for name, data in targets:
+                    staged.append((name, data if name.lower().endswith(".gif")
+                                   else _prepare_frame_bytes(data)))
+            except RuntimeError as e:
+                fail(str(e))
+                return False
+            cli = ssh_ensure(cli)
+            if not cli:
+                return False
+            show_device_screen(cli, "operation-inprogress")
+            for name, data in staged:
+                if push_bytes(cli, f"{IMAGES_DIR}/{name}", data) != 0:
+                    fail(f"push failed for {name}")
+                    return False
+                local_md5 = hashlib.md5(data).hexdigest()
+                _, out, _ = ssh_exec(cli, f"md5sum {IMAGES_DIR}/{name}")
+                if not out or out.split()[0] != local_md5:
+                    fail(f"md5 mismatch after push ({name})!")
+                    return False
+            show_device_screen(cli, "operation-done")
+            ok(f"installed {len(staged)} screen/spinner file(s)")
+    if booted:
+        if confirm and menu("Preview it on the device now?", ["Yes", "No"]) == 0:
+            startup_preview(cli, num, delay)
+        info("the new animation plays at the next boot")
+    else:
+        info("screens apply immediately; spinners on next UI load")
+    return True
+
+
+def flow_root_startup_offer(cli):
+    """Rooting extra: backup stock branding and install the bundled
+    outblindstop boot animation + off screens. Returns the (possibly
+    reconnected) cli, or None."""
+    if not BUNDLED_STARTUP_ZIP.exists() and not BUNDLED_SCREENS_DIR.exists():
+        return cli
+    num, delay, _ = startup_params(cli)
+    lines = [f"device now: {num} frames, {delay / 1000:.1f} ms/frame"]
+    if BUNDLED_STARTUP_ZIP.exists():
+        lines.append(f"boot: {BUNDLED_STARTUP_ZIP.name} in {STARTUP_LOCAL}/")
+    if BUNDLED_SCREENS_DIR.exists():
+        lines.append(f"screens: {BUNDLED_SCREENS_DIR.name}/ "
+                     f"({', '.join(sorted(p.name for p in BUNDLED_SCREENS_DIR.iterdir() if p.is_file()))})")
+    lines.append("stock is backed up first so you can revert")
+    sel = menu("Install the outblindstop boot look?",
+               ["Yes (backup stock + install)", "No (keep stock)"],
+               info_lines=lines)
+    if sel != 0:
+        return cli
+    cli = ssh_ensure(cli)
+    if not cli:
+        return None
+    if not list(STARTUP_LOCAL.glob("animation-backup-*.zip")):
+        info("backing up stock first...")
+        if not startup_backup(cli):
+            warn("backup failed, skipping the install")
+            return cli
+    else:
+        info("a stock backup already exists, skipping re-backup")
+    cli = ssh_ensure(cli)
+    if not cli:
+        return None
+    if BUNDLED_STARTUP_ZIP.exists() and startup_install(
+            cli, BUNDLED_STARTUP_ZIP, confirm=False):
+        ok("outblindstop boot animation installed, plays at the next boot")
+    if BUNDLED_SCREENS_DIR.exists():
+        cli = ssh_ensure(cli)
+        if cli and images_install(cli, BUNDLED_SCREENS_DIR, confirm=False):
+            ok("outblindstop power screens installed")
+    info("to revert or change anything later: Tweaks > Startup & animations >")
+    info("Install bundle from zip > pick an animation-backup-*.zip")
+    return cli
+
+
+def startup_preview(cli, num=None, delay=None):
+    """Replay the boot animation on the device right now using the exact
+    same code path the boot service uses (sh script start)."""
+    if not num:
+        num, delay, _ = startup_params(cli)
+    ssh_exec(cli, "killall -q mifi_display_png")
+    rc, out, err = ssh_exec(
+        cli, f"sh {STARTUP_DIR}/mifi_display_animation.sh start", timeout=60)
+    if rc != 0:
+        fail(f"preview failed: {out or err}")
+        return
+    ok("playing the boot animation on the device now")
+    info("(the device UI redraws over it when it finishes)")
+
+
+def video_to_startup_animation(video_path):
+    """ffmpeg a video into 320x240 RGB PNG frames at the stock animation
+    frame rate and pack an installable zip. The player shows each frame for
+    USLEEP, so frames are sampled at 1/0.018 s and the delay is re-derived
+    from the real video duration to keep the source timing intact."""
+    video = Path(video_path)
+    if not video.exists():
+        fail(f"{video} not found")
+        return None
+    if not shutil.which("ffmpeg"):
+        fail("ffmpeg not found on this PC (winget install ffmpeg)")
+        return None
+    info(f"converting {video.name} ...")
+    fps_target = 1_000_000 / STOCK_DELAY_US
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(video)],
+        capture_output=True, text=True)
+    try:
+        duration = float(r.stdout.strip())
+    except ValueError:
+        duration = 0.0
+    if duration > 0:
+        n_expected = max(2, round(duration * fps_target))
+        fps = n_expected / duration
+        delay = round(duration * 1_000_000 / n_expected)
+    else:
+        fps, delay = fps_target, STOCK_DELAY_US
+    STARTUP_LOCAL.mkdir(exist_ok=True)
+    zip_path = STARTUP_LOCAL / f"{video.stem}.zip"
+    with tempfile.TemporaryDirectory() as tmp:
+        vf = ("scale=320:240:force_original_aspect_ratio=decrease,"
+              "pad=320:240:(ow-iw)/2:(oh-ih)/2:color=black,"
+              f"fps={fps:.6f}")
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(video), "-vf", vf,
+             "-pix_fmt", "rgb24", str(Path(tmp) / "animation_%d.png")],
+            capture_output=True, text=True)
+        if r.returncode != 0:
+            fail(f"ffmpeg failed: {r.stderr[-400:]}")
+            return None
+        frames = sorted(Path(tmp).glob("animation_*.png"),
+                        key=lambda p: _frame_num(p.name))
+        if not frames:
+            fail("ffmpeg produced no frames")
+            return None
+        # bake the real frame count/delay into the script before packing:
+        # an unbaked template would ship __NUM_FILES__ placeholders that
+        # install's digit-matching regex can't patch
+        script_text = (ANIM_SH.replace("__NUM_FILES__", str(len(frames)))
+                              .replace("__USLEEP__", str(delay)))
+        meta = _pack_startup_zip(zip_path, frames, script_text, delay,
+                                 f"converted from {video}")
+    ok(f"{meta['num_frames']} frames @ {meta['delay_us'] / 1000:.1f} ms/frame "
+       f"({1_000_000 / meta['delay_us']:.2f} fps), "
+       f"{meta['num_frames'] * meta['delay_us'] / 1e6:.2f} s total")
+    ok(f"packed -> {zip_path}")
+    return zip_path
+
+
+def flow_startup_video(cli):
+    video = prompt("video path:", r"C:\Users\Josh\Downloads\outblindstop startup.mp4")
+    if not video:
+        return
+    zip_path = video_to_startup_animation(video)
+    if not zip_path:
+        pause()
+        return
+    if menu("Install it on the device now?", ["Not yet", "Install"]) == 1:
+        startup_install(cli, zip_path)
+
+
+def flow_startup_animation(cli):
+    while True:
+        cli = ssh_ensure(cli)
+        if not cli:
+            return
+        num, delay, _ = startup_params(cli)
+        zips = sorted(STARTUP_LOCAL.glob("*.zip")) if STARTUP_LOCAL.exists() else []
+        sel = menu("Startup & animations", [
+            "Backup everything (boot + screens + spinners)",
+            "Install bundle from zip (pick parts)",
+            "Install screens/spinners (folder or zip)",
+            "Create boot animation from a video (ffmpeg)",
+            "Preview boot animation on device",
+            "Back",
+        ], info_lines=[
+            f"current: {num} frames, {delay / 1000:.1f} ms/frame "
+            f"({1_000_000 / delay:.1f} fps), {num * delay / 1e6:.2f} s",
+            f"device: {STARTUP_DIR} + {IMAGES_DIR}   local zips: {len(zips)} in {STARTUP_LOCAL}/",
+        ])
+        if sel in (-1, 5):
+            return
+        clear()
+        banner()
+        print()
+        if sel == 0:
+            startup_backup(cli)
+        elif sel == 1:
+            zp = startup_pick_zip()
+            if zp:
+                startup_install(cli, zp)
+        elif sel == 2:
+            flow_images_install(cli)
+        elif sel == 3:
+            flow_startup_video(cli)
+        elif sel == 4:
+            startup_preview(cli)
+        pause()
+
+
 def tweak_submenu(cli):
     while True:
         # the connection may have died while we sat at the menu
@@ -1223,6 +2102,7 @@ def tweak_submenu(cli):
             "Set enabled NR5G bands (EXPERIMENTAL)",
             "5G radio enable/disable (EXPERIMENTAL)",
             "Duck (installed)" if installed else "Install duck",
+            "Startup & animations",
             "Show about screen",
             "Reboot device",
             "Back",
@@ -1230,7 +2110,7 @@ def tweak_submenu(cli):
         sel = menu("Tweaks", opts, info_lines=[
             f"{DIM}modem2_cli has ~300 commands, see modem2_cli_help.txt{RESET}",
         ])
-        if sel in (-1, 10):
+        if sel in (-1, 11):
             return
         clear()
         banner()
@@ -1279,6 +2159,8 @@ def tweak_submenu(cli):
         elif sel == 7:
             flow_duck(cli, installed)
         elif sel == 8:
+            flow_startup_animation(cli)
+        elif sel == 9:
             show_device_screen(cli, "about")
         elif sel == 9:
             if menu("Reboot device?", ["Cancel", "Reboot"]) == 1:
@@ -1286,7 +2168,7 @@ def tweak_submenu(cli):
                 ok("rebooting, ssh will drop")
                 pause()
                 return
-        if sel not in (-1, 9, 10):
+        if sel not in (-1, 9, 10, 11):
             pause()
 
 
