@@ -238,8 +238,9 @@ def flow_root(state):
         return
 
     warn("You need a working OpenVPN client config (.ovpn) that the device can")
-    warn("connect to. Credentials do NOT need to be valid")
+    warn("connect to. Credentials do NOT need to be valid.")
     warn("THE DEVICE MUST HAVE A WORKING INTERNET CONNECTION FOR THE EXPLOIT TO SUCCEED")
+    info(f"{BOLD}If you don't know what this is, you can just press enter.{BOLD}")
 
     auto_path, auto_text = find_base_ovpn()
     if auto_path:
@@ -259,7 +260,7 @@ def flow_root(state):
         pause()
         return
     if "remote " not in base_text:
-        fail("that file doesn't look like an OpenVPN config (no 'remote' line)")
+        fail("that file doesn't look like an OpenVPN config")
         pause()
         return
 

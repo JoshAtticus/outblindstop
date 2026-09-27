@@ -152,7 +152,6 @@ def main():
                    info_lines=[
                        f"device:    {BOLD}{model}{RESET}   status: {status}",
                        f"device:    {HOST}   your LAN IP: {local_ip}",
-                       f"payload:   {PAYLOAD_LOCAL} (served on :{PAYLOAD_PORT})",
                    ])
         try:
             if sel in (-1, 5):
