@@ -9,8 +9,20 @@ Use this on your own device. This does not remove SIM lock if your device has it
 
 ## Quick start
 1. Connect to the hotspot's WiFi
-2. `pip install paramiko requests pillow`
+2. `pip install -r requirements.txt`
 3. `python3 mifi_tool.py`
+
+### M2000 SSH compatibility
+
+Some M2000 firmware versions start an older Dropbear SSH server that does not
+share a key-exchange algorithm with recent Paramiko releases. The connection
+code enables the legacy algorithms only for this device connection. If you
+still see `Incompatible ssh peer (no acceptable kex algorithm)`, make sure the
+dependencies were installed from `requirements.txt` and run the tool again.
+
+This compatibility change does not unlock a carrier-locked device. It only
+allows the temporary root SSH session to be established after the payload has
+run.
 
 * **Rooting**: run the exploit, install or uninstall persistence, test access
 * **Backup**: dumps every MTD partition over SSH. Do this before changing

@@ -10,6 +10,26 @@ from .constants import HOST, ROOT_PW, SSH_PORT
 from .ui import fail, ok, warn
 
 
+def _legacy_transport_factory(sock, **kwargs):
+    """Create a Paramiko transport compatible with the M2000 Dropbear SSH.
+
+    The stock M2000 SSH daemon is old enough that modern Paramiko no longer
+    advertises its KEX and host-key algorithms by default.  Keep this
+    compatibility scoped to this device connection; do not weaken the global
+    Paramiko defaults.
+    """
+    kwargs["strict_kex"] = False
+    transport = paramiko.Transport(sock, **kwargs)
+    options = transport.get_security_options()
+    options.kex = tuple(dict.fromkeys(options.kex + (
+        "diffie-hellman-group14-sha1",
+        "diffie-hellman-group1-sha1",
+        "diffie-hellman-group-exchange-sha1",
+    )))
+    options.key_types = tuple(dict.fromkeys(options.key_types + ("ssh-rsa",)))
+    return transport
+
+
 def probe_root():
     s = socket.socket()
     s.settimeout(1.5)
@@ -31,7 +51,8 @@ def ssh_connect(timeout=3):
     cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     cli.connect(HOST, port=SSH_PORT, username="root", password=ROOT_PW,
                 look_for_keys=False, allow_agent=False, timeout=timeout,
-                banner_timeout=timeout, auth_timeout=timeout)
+                banner_timeout=timeout, auth_timeout=timeout,
+                transport_factory=_legacy_transport_factory)
     return cli
 
 
